@@ -402,6 +402,8 @@ def answer_digital_twin(payload):
     load_increase_pct = float(payload.get('loadIncreasePct', 15.0))
     ambient_temp_delta_c = float(payload.get('ambientTempDeltaC', 6.0))
     cycle_stress_pct = float(payload.get('cycleStressPct', 18.0))
+    avg_speed_kmh = float(payload.get('avgSpeedKmh', 60.0))
+    accel_aggression_pct = float(payload.get('accelAggressionPct', 10.0))
     days = int(payload.get('days', 7))
 
     feature_means = {
@@ -429,8 +431,11 @@ def answer_digital_twin(payload):
     # Cycling stress: ~0.8% additional degradation per 10% cycle stress increase
     cycle_accel = (cycle_stress_pct / 10) * 0.8
     
+    # Acceleration stress: ~2.5% additional degradation per 10% aggression
+    accel_accel = (accel_aggression_pct / 10) * 2.5
+    
     # Combined stress multiplier
-    total_stress = 1.0 + (temp_accel + load_accel + cycle_accel) / 100.0
+    total_stress = 1.0 + (temp_accel + load_accel + cycle_accel + accel_accel) / 100.0
     scenario_degradation_rate = base_degradation_rate * total_stress
     
     for day in range(days + 1):
@@ -465,9 +470,13 @@ def answer_digital_twin(payload):
     final_scenario_soh = max(0.0, base_soh - (days * scenario_degradation_rate))
     degradation_delta = final_baseline_soh - final_scenario_soh
     
-    # DTE calculation based on current SoH and consumption rate (200 Wh/km nominal)
-    consumption_rate = 200 * (1 + load_increase_pct / 100.0)  # Wh/km adjusted for load
-    nominal_dte = (base_soh / 100.0) * 63.5 * 60 / consumption_rate  # 63.5V, 60Ah nominal
+    # DTE calculation based on current SoH, speed, acceleration, and load
+    speed_factor = max(0.5, (avg_speed_kmh / 60.0) ** 2)
+    accel_factor = 1.0 + (accel_aggression_pct / 100.0) * 0.5
+    consumption_rate = 200 * speed_factor * accel_factor * (1 + load_increase_pct / 100.0)
+    
+    nominal_consumption = 200 * (1 + load_increase_pct / 100.0)
+    nominal_dte = (base_soh / 100.0) * 63.5 * 60 / nominal_consumption
     scenario_dte = (final_scenario_soh / 100.0) * 63.5 * 60 / consumption_rate
 
     return {
@@ -483,11 +492,13 @@ def answer_digital_twin(payload):
             'loadIncreasePct': load_increase_pct,
             'ambientTempDeltaC': ambient_temp_delta_c,
             'cycleStressPct': cycle_stress_pct,
+            'avgSpeedKmh': avg_speed_kmh,
+            'accelAggressionPct': accel_aggression_pct,
             'stressMultiplier': round(total_stress, 3),
             'degradationRateBaseline': round(base_degradation_rate, 3),
             'degradationRateScenario': round(scenario_degradation_rate, 3),
         },
-        'physics': 'Arrhenius + load scaling + cycle stress model'
+        'physics': 'Arrhenius + load scaling + cycle stress + aero/accel model'
     }
 
 

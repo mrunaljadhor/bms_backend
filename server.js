@@ -200,8 +200,8 @@ app.post('/api/intelligence/federated', (req, res) => {
 
 app.post('/api/intelligence/digital-twin', (req, res) => {
   try {
-    const { baseSoh = 85, loadIncreasePct = 15, ambientTempDeltaC = 6, cycleStressPct = 18, days = 7 } = req.body || {};
-    const result = runPythonAnalytics('digital_twin', { baseSoh, loadIncreasePct, ambientTempDeltaC, cycleStressPct, days });
+    const { baseSoh = 85, loadIncreasePct = 15, ambientTempDeltaC = 6, cycleStressPct = 18, avgSpeedKmh = 60, accelAggressionPct = 10, days = 7 } = req.body || {};
+    const result = runPythonAnalytics('digital_twin', { baseSoh, loadIncreasePct, ambientTempDeltaC, cycleStressPct, avgSpeedKmh, accelAggressionPct, days });
     return res.json({
       feature: 'digital_twin',
       ...result,
@@ -326,10 +326,15 @@ app.post('/api/predict/dte', (req, res) => {
  */
 app.post('/api/route/distance', async (req, res) => {
   try {
-    const { origin, destination } = req.body;
+    let { origin, destination, waypoints, roundTrip } = req.body;
     
     if (!origin || !destination) {
       return res.status(400).json({ error: 'Origin and destination required' });
+    }
+    
+    if (roundTrip) {
+      waypoints = waypoints ? (Array.isArray(waypoints) ? [...waypoints, destination] : [waypoints, destination]) : [destination];
+      destination = origin;
     }
     
     const params = {
@@ -339,6 +344,10 @@ app.post('/api/route/distance', async (req, res) => {
       mode: 'driving',
       units: 'metric'
     };
+    
+    if (waypoints && waypoints.length > 0) {
+      params.waypoints = Array.isArray(waypoints) ? waypoints.join('|') : waypoints;
+    }
     
     const response = await axios.get(
       'https://maps.googleapis.com/maps/api/directions/json',
@@ -350,9 +359,22 @@ app.post('/api/route/distance', async (req, res) => {
     }
     
     const route = response.data.routes[0];
-    const distance_m = route.legs[0].distance.value;
+    let distance_m = 0;
+    let duration_s = 0;
+    let leg_details = [];
+    
+    route.legs.forEach(leg => {
+      distance_m += leg.distance.value;
+      duration_s += leg.duration.value;
+      leg_details.push({
+        distance_km: leg.distance.value / 1000,
+        duration_minutes: (leg.duration.value / 60).toFixed(1),
+        start_address: leg.start_address,
+        end_address: leg.end_address
+      });
+    });
+    
     const distance_km = distance_m / 1000;
-    const duration_s = route.legs[0].duration.value;
     
     return res.json({
       origin,
@@ -362,7 +384,7 @@ app.post('/api/route/distance', async (req, res) => {
       duration_s,
       duration_minutes: (duration_s / 60).toFixed(1),
       route_summary: route.summary,
-      legs: route.legs.length
+      legs: leg_details
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -423,10 +445,15 @@ app.post('/api/route/geometry', async (req, res) => {
  */
 app.post('/api/feasibility', async (req, res) => {
   try {
-    const { current_soc = 100, origin, destination } = req.body;
+    let { current_soc = 100, origin, destination, waypoints, roundTrip, chargeAtStops = false } = req.body;
     
     if (!origin || !destination) {
       return res.status(400).json({ error: 'Origin and destination required' });
+    }
+    
+    if (roundTrip) {
+      waypoints = waypoints ? (Array.isArray(waypoints) ? [...waypoints, destination] : [waypoints, destination]) : [destination];
+      destination = origin;
     }
     
     // Get route distance
@@ -438,6 +465,10 @@ app.post('/api/feasibility', async (req, res) => {
       units: 'metric'
     };
     
+    if (waypoints && waypoints.length > 0) {
+      params.waypoints = Array.isArray(waypoints) ? waypoints.join('|') : waypoints;
+    }
+    
     const mapResponse = await axios.get(
       'https://maps.googleapis.com/maps/api/directions/json',
       { params }
@@ -447,31 +478,53 @@ app.post('/api/feasibility', async (req, res) => {
       return res.status(400).json({ error: mapResponse.data.error_message });
     }
     
-    const route_distance_km = mapResponse.data.routes[0].legs[0].distance.value / 1000;
+    let total_distance_km = 0;
+    const legs = mapResponse.data.routes[0].legs;
     
-    // Check feasibility
-    const feasibility = checkFeasibility(current_soc, route_distance_km);
-    
-    // AMSA Decision Logic
+    // Check feasibility segment by segment
+    let simulated_soc = current_soc;
+    let overall_status = 'SAFE';
     let amsa_action = 'MANUAL_MODE';
     let amsa_alert = null;
+    let recommendation = 'Both ECO and SPORT modes available';
     
-    if (feasibility.status === 'IMPOSSIBLE') {
-      amsa_action = 'CHARGE_REQUIRED';
-      amsa_alert = '⚠️ CHARGE REQUIRED - Cannot reach destination';
-    } else if (feasibility.status === 'CRITICAL') {
-      amsa_action = 'FORCE_ECO_MODE';
-      amsa_alert = '🔴 CRITICAL - Forced ECO mode. SPORT mode disabled.';
+    for (let i = 0; i < legs.length; i++) {
+      const leg_dist = legs[i].distance.value / 1000;
+      total_distance_km += leg_dist;
+      
+      const leg_feasibility = checkFeasibility(simulated_soc, leg_dist);
+      
+      if (leg_feasibility.status === 'IMPOSSIBLE') {
+        overall_status = 'IMPOSSIBLE';
+        amsa_action = 'CHARGE_REQUIRED';
+        amsa_alert = `⚠️ CHARGE REQUIRED - Cannot reach leg ${i+1}`;
+        recommendation = `Charge needed before reaching ${legs[i].end_address}`;
+        break; // Trip fails here
+      } else if (leg_feasibility.status === 'CRITICAL' && overall_status !== 'IMPOSSIBLE') {
+        overall_status = 'CRITICAL';
+        amsa_action = 'FORCE_ECO_MODE';
+        amsa_alert = '🔴 CRITICAL - Forced ECO mode. SPORT mode disabled.';
+        recommendation = 'MUST USE ECO MODE';
+      }
+      
+      // Update SOC for next leg (assuming ECO consumption for survival)
+      simulated_soc -= (leg_dist / leg_feasibility.eco_dte) * simulated_soc;
+      if (chargeAtStops && i < legs.length - 1) {
+        simulated_soc = 100; // Reset SOC if charging at stops
+      }
     }
+    
+    // Overall feasibility for fallback
+    const feasibility = checkFeasibility(current_soc, total_distance_km);
     
     return res.json({
       current_soc,
-      route_distance_km: route_distance_km.toFixed(2),
-      feasibility,
+      route_distance_km: total_distance_km.toFixed(2),
+      feasibility: { ...feasibility, status: overall_status, recommendation },
       amsa_decision: {
         action: amsa_action,
         alert: amsa_alert,
-        recommendation: feasibility.recommendation
+        recommendation
       },
       timestamp: new Date().toISOString()
     });
