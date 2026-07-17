@@ -67,23 +67,37 @@ const CONFIG = {
  * Calculate DTE (Distance to Empty)
  * DTE = (Current_Capacity * Voltage * 1000) / Consumption_Rate
  */
-function calculateDTE(current_soc, drive_mode = 'ECO') {
-  const battery_capacity_wh = CONFIG.BATTERY.nominal_capacity * 60 * 10; // Ah * V * 10
+function calculateDTE(current_soc, drive_mode = 'ECO', env = {}) {
+  const {
+    baseSoh = 100,
+    ambientTempDeltaC = 0,
+    avgSpeedKmh = 60,
+    accelAggressionPct = 0,
+    elevationGrade = 0
+  } = env;
+
+  const realSoh = Math.max(0, Math.min(100, baseSoh));
+  const battery_capacity_wh = (CONFIG.BATTERY.nominal_capacity * CONFIG.BATTERY.nominal_voltage) * (realSoh / 100);
   const available_energy = (current_soc / 100) * battery_capacity_wh;
-  const consumption_rate = CONFIG.CONSUMPTION[drive_mode];
   
-  return available_energy / consumption_rate;
+  const base_consumption = CONFIG.CONSUMPTION[drive_mode];
+  
+  const tempPenalty = 1 + Math.max(0, ambientTempDeltaC * 0.005);
+  const speedFactor = Math.max(0.5, (avgSpeedKmh / 60.0) ** 2);
+  const accelPenalty = 1 + (accelAggressionPct / 100) * 0.2;
+  const elevationPenalty = 1 + (elevationGrade > 0 ? elevationGrade * 0.12 : elevationGrade * 0.05);
+
+  const final_consumption_rate = base_consumption * speedFactor * accelPenalty * tempPenalty * elevationPenalty;
+  
+  return available_energy / final_consumption_rate;
 }
 
-/**
- * Calculate route feasibility
- */
-function checkFeasibility(current_soc, route_distance_km) {
-  const eco_dte = calculateDTE(current_soc, 'ECO');
-  const sport_dte = calculateDTE(current_soc, 'SPORT');
+function checkFeasibility(current_soc, route_distance_km, env = {}) {
+  const eco_dte = calculateDTE(current_soc, 'ECO', env);
+  const sport_dte = calculateDTE(current_soc, 'SPORT', env);
   
   let status = 'SAFE';
-  let recommendation = 'Any mode available';
+  let recommendation = 'Both ECO and SPORT modes available';
   
   if (route_distance_km > eco_dte) {
     status = 'IMPOSSIBLE';
@@ -91,9 +105,6 @@ function checkFeasibility(current_soc, route_distance_km) {
   } else if (route_distance_km > sport_dte) {
     status = 'CRITICAL';
     recommendation = 'MUST USE ECO MODE - SPORT mode insufficient for route';
-  } else {
-    status = 'SAFE';
-    recommendation = 'Both ECO and SPORT modes available';
   }
   
   return {
@@ -445,7 +456,18 @@ app.post('/api/route/geometry', async (req, res) => {
  */
 app.post('/api/feasibility', async (req, res) => {
   try {
-    let { current_soc = 100, origin, destination, waypoints, roundTrip, chargeAtStops = false } = req.body;
+    let { 
+      current_soc = 100, 
+      origin, 
+      destination, 
+      waypoints, 
+      roundTrip, 
+      chargeAtStops = false,
+      baseSoh = 100,
+      ambientTempDeltaC = 0,
+      avgSpeedKmh = 60,
+      accelAggressionPct = 0
+    } = req.body;
     
     if (!origin || !destination) {
       return res.status(400).json({ error: 'Origin and destination required' });
@@ -456,7 +478,6 @@ app.post('/api/feasibility', async (req, res) => {
       destination = origin;
     }
     
-    // Get route distance
     const params = {
       key: CONFIG.GOOGLE_MAPS_KEY,
       origin,
@@ -467,6 +488,34 @@ app.post('/api/feasibility', async (req, res) => {
     
     if (waypoints && waypoints.length > 0) {
       params.waypoints = Array.isArray(waypoints) ? waypoints.join('|') : waypoints;
+    }
+    
+    // Fetch Elevation
+    let elevationGrade = 0;
+    try {
+      const locations = [origin];
+      if (waypoints && waypoints.length > 0) {
+         locations.push(...(Array.isArray(waypoints) ? waypoints : waypoints.split('|')));
+      }
+      locations.push(destination);
+      
+      const elevRes = await axios.get('https://maps.googleapis.com/maps/api/elevation/json', {
+        params: { key: CONFIG.GOOGLE_MAPS_KEY, locations: locations.join('|') }
+      });
+      
+      if (elevRes.data.status === 'OK' && elevRes.data.results.length >= 2) {
+        const results = elevRes.data.results;
+        let totalClimbMeters = 0;
+        for(let i = 0; i < results.length - 1; i++) {
+           const climb = results[i+1].elevation - results[i].elevation;
+           if (climb > 0) totalClimbMeters += climb;
+        }
+        // We'll calculate the grade after we know the distance
+        // Temporarily store total climb
+        elevationGrade = totalClimbMeters;
+      }
+    } catch (e) {
+      console.log('Elevation fetch failed:', e.message);
     }
     
     const mapResponse = await axios.get(
@@ -480,8 +529,15 @@ app.post('/api/feasibility', async (req, res) => {
     
     let total_distance_km = 0;
     const legs = mapResponse.data.routes[0].legs;
+    legs.forEach(leg => total_distance_km += leg.distance.value / 1000);
     
-    // Check feasibility segment by segment
+    // Convert total climb to a grade percentage
+    if (elevationGrade > 0 && total_distance_km > 0) {
+      elevationGrade = (elevationGrade / (total_distance_km * 1000)) * 100;
+    }
+    
+    const envParams = { baseSoh, ambientTempDeltaC, avgSpeedKmh, accelAggressionPct, elevationGrade };
+
     let simulated_soc = current_soc;
     let overall_status = 'SAFE';
     let amsa_action = 'MANUAL_MODE';
@@ -490,16 +546,14 @@ app.post('/api/feasibility', async (req, res) => {
     
     for (let i = 0; i < legs.length; i++) {
       const leg_dist = legs[i].distance.value / 1000;
-      total_distance_km += leg_dist;
-      
-      const leg_feasibility = checkFeasibility(simulated_soc, leg_dist);
+      const leg_feasibility = checkFeasibility(simulated_soc, leg_dist, envParams);
       
       if (leg_feasibility.status === 'IMPOSSIBLE') {
         overall_status = 'IMPOSSIBLE';
         amsa_action = 'CHARGE_REQUIRED';
         amsa_alert = `⚠️ CHARGE REQUIRED - Cannot reach leg ${i+1}`;
         recommendation = `Charge needed before reaching ${legs[i].end_address}`;
-        break; // Trip fails here
+        break;
       } else if (leg_feasibility.status === 'CRITICAL' && overall_status !== 'IMPOSSIBLE') {
         overall_status = 'CRITICAL';
         amsa_action = 'FORCE_ECO_MODE';
@@ -507,15 +561,13 @@ app.post('/api/feasibility', async (req, res) => {
         recommendation = 'MUST USE ECO MODE';
       }
       
-      // Update SOC for next leg (assuming ECO consumption for survival)
       simulated_soc -= (leg_dist / leg_feasibility.eco_dte) * simulated_soc;
       if (chargeAtStops && i < legs.length - 1) {
-        simulated_soc = 100; // Reset SOC if charging at stops
+        simulated_soc = 100;
       }
     }
     
-    // Overall feasibility for fallback
-    const feasibility = checkFeasibility(current_soc, total_distance_km);
+    const feasibility = checkFeasibility(current_soc, total_distance_km, envParams);
     
     return res.json({
       current_soc,
