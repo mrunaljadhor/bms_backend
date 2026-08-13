@@ -63,17 +63,15 @@ const CONFIG = {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/**
- * Calculate DTE (Distance to Empty)
- * DTE = (Current_Capacity * Voltage * 1000) / Consumption_Rate
- */
 function calculateDTE(current_soc, drive_mode = 'ECO', env = {}) {
   const {
     baseSoh = 100,
     ambientTempDeltaC = 0,
     avgSpeedKmh = 60,
     accelAggressionPct = 0,
-    elevationGrade = 0
+    uphillGrade = 0,
+    downhillGrade = 0,
+    trafficJamRatio = 0
   } = env;
 
   const realSoh = Math.max(0, Math.min(100, baseSoh));
@@ -82,12 +80,25 @@ function calculateDTE(current_soc, drive_mode = 'ECO', env = {}) {
   
   const base_consumption = CONFIG.CONSUMPTION[drive_mode];
   
+  // 1. Aerodynamic Drag (exponential with speed)
+  const effectiveSpeed = avgSpeedKmh * (1 - (trafficJamRatio * 0.5));
+  const aeroFactor = Math.max(0.5, (effectiveSpeed / 60.0) ** 2);
+  
+  // 2. Stop-and-Go Acceleration (Traffic dictates torque spikes)
+  const stopAndGoPenalty = 1 + (trafficJamRatio * (0.3 + (accelAggressionPct / 100) * 0.4));
+  const baseAccelPenalty = 1 + (accelAggressionPct / 100) * 0.15;
+  const totalAccelPenalty = stopAndGoPenalty * baseAccelPenalty;
+  
+  // 3. Uphill Climbing (massive power drain)
+  const uphillPenalty = 1 + (uphillGrade * 0.15);
+  
+  // 4. Downhill Regenerative Braking (recharges battery)
+  const regenEfficiency = 0.6 + (trafficJamRatio * 0.2); 
+  const downhillBonus = 1 - (downhillGrade * 0.08 * regenEfficiency);
+  
   const tempPenalty = 1 + Math.max(0, ambientTempDeltaC * 0.005);
-  const speedFactor = Math.max(0.5, (avgSpeedKmh / 60.0) ** 2);
-  const accelPenalty = 1 + (accelAggressionPct / 100) * 0.2;
-  const elevationPenalty = 1 + (elevationGrade > 0 ? elevationGrade * 0.12 : elevationGrade * 0.05);
 
-  const final_consumption_rate = base_consumption * speedFactor * accelPenalty * tempPenalty * elevationPenalty;
+  let final_consumption_rate = base_consumption * aeroFactor * totalAccelPenalty * uphillPenalty * Math.max(0.2, downhillBonus) * tempPenalty;
   
   return available_energy / final_consumption_rate;
 }
@@ -478,65 +489,118 @@ app.post('/api/feasibility', async (req, res) => {
       destination = origin;
     }
     
-    const params = {
-      key: CONFIG.GOOGLE_MAPS_KEY,
-      origin,
-      destination,
-      mode: 'driving',
-      units: 'metric'
-    };
-    
-    if (waypoints && waypoints.length > 0) {
-      params.waypoints = Array.isArray(waypoints) ? waypoints.join('|') : waypoints;
-    }
-    
-    // Fetch Elevation
-    let elevationGrade = 0;
-    try {
-      const locations = [origin];
-      if (waypoints && waypoints.length > 0) {
-         locations.push(...(Array.isArray(waypoints) ? waypoints : waypoints.split('|')));
-      }
-      locations.push(destination);
-      
-      const elevRes = await axios.get('https://maps.googleapis.com/maps/api/elevation/json', {
-        params: { key: CONFIG.GOOGLE_MAPS_KEY, locations: locations.join('|') }
-      });
-      
-      if (elevRes.data.status === 'OK' && elevRes.data.results.length >= 2) {
-        const results = elevRes.data.results;
-        let totalClimbMeters = 0;
-        for(let i = 0; i < results.length - 1; i++) {
-           const climb = results[i+1].elevation - results[i].elevation;
-           if (climb > 0) totalClimbMeters += climb;
-        }
-        // We'll calculate the grade after we know the distance
-        // Temporarily store total climb
-        elevationGrade = totalClimbMeters;
-      }
-    } catch (e) {
-      console.log('Elevation fetch failed:', e.message);
-    }
-    
-    const mapResponse = await axios.get(
-      'https://maps.googleapis.com/maps/api/directions/json',
-      { params }
-    );
-    
-    if (mapResponse.data.status !== 'OK') {
-      return res.status(400).json({ error: mapResponse.data.error_message });
-    }
+    const tomtomKey = process.env.NEXT_PUBLIC_TOMTOM_API_KEY || process.env.TOMTOM_API_KEY;
     
     let total_distance_km = 0;
-    const legs = mapResponse.data.routes[0].legs;
-    legs.forEach(leg => total_distance_km += leg.distance.value / 1000);
+    let legs = [];
+    let pathCoordinates = [];
+    let trafficJamRatio = 0;
+
+    const parseCoords = (c) => {
+      const pts = c.split(',').map(n => Number(n.trim()));
+      return { lat: pts[0], lng: pts[1] };
+    };
+    const orig = parseCoords(origin);
+    const dest = parseCoords(destination);
     
-    // Convert total climb to a grade percentage
-    if (elevationGrade > 0 && total_distance_km > 0) {
-      elevationGrade = (elevationGrade / (total_distance_km * 1000)) * 100;
+    if (tomtomKey) {
+      let routeUrl = `https://api.tomtom.com/routing/1/calculateRoute/${orig.lat},${orig.lng}`;
+      if (waypoints && waypoints.length > 0) {
+        const wps = Array.isArray(waypoints) ? waypoints : waypoints.split('|');
+        wps.forEach(wp => {
+          const p = parseCoords(wp);
+          routeUrl += `:${p.lat},${p.lng}`;
+        });
+      }
+      routeUrl += `:${dest.lat},${dest.lng}/json?key=${tomtomKey}&sectionType=traffic&traffic=true`;
+      
+      const routeRes = await axios.get(routeUrl);
+      const routeData = routeRes.data.routes[0];
+      
+      total_distance_km = routeData.summary.lengthInMeters / 1000;
+      
+      routeData.legs.forEach(leg => {
+         legs.push({ distance: { value: leg.summary.lengthInMeters }, end_address: 'Waypoint' });
+         leg.points.forEach(p => pathCoordinates.push({ lat: p.latitude, lng: p.longitude }));
+      });
+      
+      let delayMeters = 0;
+      const sections = routeData.sections || [];
+      sections.filter(s => s.sectionType === 'TRAFFIC').forEach(sec => {
+         if (sec.simpleCategory === 'JAM' || sec.delayInSeconds > 20) {
+            delayMeters += (sec.endPointIndex - sec.startPointIndex) * 50; 
+         }
+      });
+      trafficJamRatio = Math.min(1.0, delayMeters / routeData.summary.lengthInMeters);
+
+    } else {
+       let coordsStr = `${orig.lng},${orig.lat}`;
+       if (waypoints && waypoints.length > 0) {
+          const wps = Array.isArray(waypoints) ? waypoints : waypoints.split('|');
+          wps.forEach(wp => {
+            const p = parseCoords(wp);
+            coordsStr += `;${p.lng},${p.lat}`;
+          });
+       }
+       coordsStr += `;${dest.lng},${dest.lat}`;
+       
+       const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=simplified&geometries=geojson`;
+       const osrmRes = await axios.get(osrmUrl);
+       const routeData = osrmRes.data.routes[0];
+       total_distance_km = routeData.distance / 1000;
+       
+       const routeLegs = routeData.legs || [{distance: routeData.distance}];
+       routeLegs.forEach(leg => {
+          legs.push({ distance: { value: leg.distance }, end_address: 'Waypoint' });
+       });
+       routeData.geometry.coordinates.forEach(c => pathCoordinates.push({ lat: c[1], lng: c[0] }));
     }
     
-    const envParams = { baseSoh, ambientTempDeltaC, avgSpeedKmh, accelAggressionPct, elevationGrade };
+    // 2. Fetch Free Elevation from OpenTopoData
+    let uphillClimbMeters = 0;
+    let downhillDescentMeters = 0;
+    
+    try {
+      if (pathCoordinates.length > 0) {
+         const sampleRate = Math.max(1, Math.floor(pathCoordinates.length / 100));
+         const sampledPoints = pathCoordinates.filter((_, i) => i % sampleRate === 0);
+         
+         const locationsStr = sampledPoints.map(p => `${p.lat},${p.lng}`).join('|');
+         const elevRes = await axios.get(`https://api.opentopodata.org/v1/srtm90m?locations=${locationsStr}`);
+         
+         if (elevRes.data.status === 'OK' && elevRes.data.results.length >= 2) {
+            const results = elevRes.data.results;
+            for(let i = 0; i < results.length - 1; i++) {
+               const elev1 = results[i].elevation;
+               const elev2 = results[i+1].elevation;
+               if (elev1 !== null && elev2 !== null) {
+                  const diff = elev2 - elev1;
+                  if (diff > 0) uphillClimbMeters += diff;
+                  else if (diff < 0) downhillDescentMeters += Math.abs(diff);
+               }
+            }
+         }
+      }
+    } catch (e) {
+      console.log('OpenTopoData fetch failed:', e.message);
+    }
+    
+    let uphillGrade = 0;
+    let downhillGrade = 0;
+    if (total_distance_km > 0) {
+       uphillGrade = (uphillClimbMeters / (total_distance_km * 1000)) * 100;
+       downhillGrade = (downhillDescentMeters / (total_distance_km * 1000)) * 100;
+    }
+    
+    const envParams = { 
+       baseSoh, 
+       ambientTempDeltaC, 
+       avgSpeedKmh, 
+       accelAggressionPct, 
+       uphillGrade,
+       downhillGrade,
+       trafficJamRatio
+    };
 
     let simulated_soc = current_soc;
     let overall_status = 'SAFE';
