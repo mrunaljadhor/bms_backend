@@ -642,6 +642,16 @@ app.post('/api/feasibility', async (req, res) => {
         alert: amsa_alert,
         recommendation
       },
+      physics_metrics: {
+        uphill_climb_meters: Number(uphillClimbMeters.toFixed(2)),
+        downhill_descent_meters: Number(downhillDescentMeters.toFixed(2)),
+        uphill_grade_pct: Number(uphillGrade.toFixed(2)),
+        downhill_grade_pct: Number(downhillGrade.toFixed(2)),
+        traffic_jam_ratio: Number(trafficJamRatio.toFixed(3)),
+        regen_efficiency: Number((0.6 + (trafficJamRatio * 0.2)).toFixed(2)),
+        downhill_bonus_pct: Number((downhillGrade * 0.08 * (0.6 + (trafficJamRatio * 0.2)) * 100).toFixed(2)),
+        torque_penalty_pct: Number((trafficJamRatio * (0.3 + (accelAggressionPct / 100) * 0.4)) * 100).toFixed(2)
+      },
       timestamp: new Date().toISOString()
     });
   } catch (error) {
