@@ -566,7 +566,7 @@ app.post('/api/feasibility', async (req, res) => {
          const sampledPoints = pathCoordinates.filter((_, i) => i % sampleRate === 0);
          
          const locationsStr = sampledPoints.map(p => `${p.lat},${p.lng}`).join('|');
-         const elevRes = await axios.get(`https://api.opentopodata.org/v1/aster30m?locations=${locationsStr}`);
+         const elevRes = await axios.get(`https://api.opentopodata.org/v1/cop30?locations=${locationsStr}`);
          
          if (elevRes.data.status === 'OK' && elevRes.data.results.length >= 2) {
             const results = elevRes.data.results;
