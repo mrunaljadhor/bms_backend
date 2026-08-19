@@ -90,6 +90,9 @@ def init_chroma_vectorstore():
             f"Temperature range: {df['Temperature(C)'].min():.2f} to {df['Temperature(C)'].max():.2f}",
             f"Capacity range: {df['Capacity(Ah)'].min():.3f} to {df['Capacity(Ah)'].max():.3f}",
             f"Cycle count range: {df['Cycle_Count'].min()} to {df['Cycle_Count'].max()}",
+            f"Speed range: {df['Speed(km/h)'].min():.1f} to {df['Speed(km/h)'].max():.1f} km/h",
+            f"Acceleration range: {df['Acceleration(m/s^2)'].min():.3f} to {df['Acceleration(m/s^2)'].max():.3f} m/s^2",
+            f"Braking events recorded: {df['Braking'].sum()}"
         ]
         for line in fleet_summary:
             documents.append(Document(page_content=line, metadata={'source': 'fleet_summary'}))
@@ -124,7 +127,7 @@ def safe_mean(values, default=0.0):
 
 def load_battery_frame():
     df = pd.read_csv(DATASET_PATH)
-    numeric_columns = ['Voltage(V)', 'Current(A)', 'Temperature(C)', 'Capacity(Ah)', 'Cycle_Count']
+    numeric_columns = ['Voltage(V)', 'Current(A)', 'Temperature(C)', 'Capacity(Ah)', 'Cycle_Count', 'Speed(km/h)', 'Acceleration(m/s^2)']
     for column in numeric_columns:
         if column not in df.columns:
             raise ValueError(f'Missing expected column: {column}')
