@@ -26,7 +26,7 @@ from langchain_community.vectorstores import Chroma
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DATASET_PATH = ROOT / 'battery_data.csv'
+DATASET_PATH = ROOT / 'trinity_ev_synthetic_dataset.csv'
 TEXT_SOURCES = [
     ROOT / 'PROJECT_SUMMARY.md',
     ROOT / 'QUICK_START.md',
@@ -85,11 +85,11 @@ def init_chroma_vectorstore():
 
         fleet_summary = [
             f"Battery dataset rows: {len(df)}",
-            f"Voltage range: {df['Voltage(V)'].min():.3f} to {df['Voltage(V)'].max():.3f}",
-            f"Current range: {df['Current(A)'].min():.3f} to {df['Current(A)'].max():.3f}",
-            f"Temperature range: {df['Temperature(C)'].min():.2f} to {df['Temperature(C)'].max():.2f}",
-            f"Capacity range: {df['Capacity(Ah)'].min():.3f} to {df['Capacity(Ah)'].max():.3f}",
-            f"Cycle count range: {df['Cycle_Count'].min()} to {df['Cycle_Count'].max()}",
+            f"Voltage range: {df['Voltage_V'].min():.3f} to {df['Voltage_V'].max():.3f}",
+            f"Current range: {df['Current_A'].min():.3f} to {df['Current_A'].max():.3f}",
+            f"Temperature range: {df['Max_Temp_C'].min():.2f} to {df['Max_Temp_C'].max():.2f}",
+            f"SOC range: {df['Actual_SOC'].min():.1f}% to {df['Actual_SOC'].max():.1f}%",
+            f"Power range: {df['Power_KW'].min():.3f} to {df['Power_KW'].max():.3f} kW",
             f"Speed range: {df['Speed(km/h)'].min():.1f} to {df['Speed(km/h)'].max():.1f} km/h",
             f"Acceleration range: {df['Acceleration(m/s^2)'].min():.3f} to {df['Acceleration(m/s^2)'].max():.3f} m/s^2",
             f"Braking events recorded: {df['Braking'].sum()}"
@@ -127,7 +127,7 @@ def safe_mean(values, default=0.0):
 
 def load_battery_frame():
     df = pd.read_csv(DATASET_PATH)
-    numeric_columns = ['Voltage(V)', 'Current(A)', 'Temperature(C)', 'Capacity(Ah)', 'Cycle_Count', 'Speed(km/h)', 'Acceleration(m/s^2)']
+    numeric_columns = ['Voltage_V', 'Current_A', 'Max_Temp_C', 'Actual_SOC', 'Power_KW', 'Speed(km/h)', 'Acceleration(m/s^2)']
     for column in numeric_columns:
         if column not in df.columns:
             raise ValueError(f'Missing expected column: {column}')
