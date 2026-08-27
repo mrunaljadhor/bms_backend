@@ -407,6 +407,7 @@ def answer_digital_twin(payload):
     cycle_stress_pct = float(payload.get('cycleStressPct', 18.0))
     avg_speed_kmh = float(payload.get('avgSpeedKmh', 60.0))
     accel_aggression_pct = float(payload.get('accelAggressionPct', 10.0))
+    braking_aggression_pct = float(payload.get('brakingAggressionPct', 10.0))
     days = int(payload.get('days', 7))
 
     feature_means = {
@@ -437,8 +438,11 @@ def answer_digital_twin(payload):
     # Acceleration stress: ~2.5% additional degradation per 10% aggression
     accel_accel = (accel_aggression_pct / 10) * 2.5
     
+    # Braking stress: ~1.5% additional degradation per 10% aggression (thermal/mechanical)
+    braking_accel = (braking_aggression_pct / 10) * 1.5
+    
     # Combined stress multiplier
-    total_stress = 1.0 + (temp_accel + load_accel + cycle_accel + accel_accel) / 100.0
+    total_stress = 1.0 + (temp_accel + load_accel + cycle_accel + accel_accel + braking_accel) / 100.0
     scenario_degradation_rate = base_degradation_rate * total_stress
     
     for day in range(days + 1):
@@ -473,10 +477,11 @@ def answer_digital_twin(payload):
     final_scenario_soh = max(0.0, base_soh - (days * scenario_degradation_rate))
     degradation_delta = final_baseline_soh - final_scenario_soh
     
-    # DTE calculation based on current SoH, speed, acceleration, and load
+    # DTE calculation based on current SoH, speed, acceleration, braking (regen), and load
     speed_factor = max(0.5, (avg_speed_kmh / 60.0) ** 2)
     accel_factor = 1.0 + (accel_aggression_pct / 100.0) * 0.5
-    consumption_rate = 200 * speed_factor * accel_factor * (1 + load_increase_pct / 100.0)
+    regen_bonus = 1.0 - (braking_aggression_pct / 100.0) * 0.2
+    consumption_rate = 200 * speed_factor * accel_factor * regen_bonus * (1 + load_increase_pct / 100.0)
     
     nominal_consumption = 200 * (1 + load_increase_pct / 100.0)
     nominal_dte = (base_soh / 100.0) * 63.5 * 60 / nominal_consumption
@@ -497,6 +502,7 @@ def answer_digital_twin(payload):
             'cycleStressPct': cycle_stress_pct,
             'avgSpeedKmh': avg_speed_kmh,
             'accelAggressionPct': accel_aggression_pct,
+            'brakingAggressionPct': braking_aggression_pct,
             'stressMultiplier': round(total_stress, 3),
             'degradationRateBaseline': round(base_degradation_rate, 3),
             'degradationRateScenario': round(scenario_degradation_rate, 3),
